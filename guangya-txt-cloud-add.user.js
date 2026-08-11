@@ -624,6 +624,12 @@
     /* ============================================================
      * UI
      * ============================================================ */
+    // 文件夹名截断显示,防止长名把 select 撑得太宽
+    function truncateFolder(name, maxLen) {
+        const s = String(name || "");
+        const max = maxLen || 40;
+        return s.length > max ? s.slice(0, max) + "…" : s;
+    }
     function buildUI() {
         if (document.getElementById("gy-txt-panel")) return;
         const panel = document.createElement("div");
@@ -654,7 +660,7 @@
                     <button id="gy-txt-search-btn" style="background:#0969da;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;white-space:nowrap;">搜索</button>
                 </div>
                 <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;">
-                    <select id="gy-txt-folder" style="flex:1;padding:8px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;">
+                    <select id="gy-txt-folder" style="flex:1;padding:8px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;max-width:280px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;box-sizing:border-box;">
                         <option value="">(根目录)</option>
                     </select>
                     <button id="gy-txt-folder-btn" style="background:#0969da;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;white-space:nowrap;">📁 全部文件夹</button>
@@ -778,7 +784,7 @@
                 folders.forEach(f => {
                     const opt = document.createElement("option");
                     opt.value = f.fileId;
-                    opt.textContent = f.name;
+                    opt.textContent = truncateFolder(f.name, 36);
                     sel.appendChild(opt);
                 });
                 // 恢复之前选的(用 fileId 匹配)
@@ -792,7 +798,8 @@
                 log("已加载根目录 " + folders.length + " 个文件夹(搜索框可全盘搜子文件夹)");
                 sel.onchange = () => {
                     const fid = sel.value;
-                    const name = fid ? sel.options[sel.selectedIndex].textContent : "(根目录)";
+                    const full = folders.find(f => f.fileId === fid);
+                    const name = full ? full.name : "(根目录)";
                     setTargetFolder(fid ? { fileId: fid, name } : null);
                     log("目标文件夹: " + name);
                 };
@@ -819,7 +826,7 @@
                 folders.forEach(f => {
                     const opt = document.createElement("option");
                     opt.value = f.fileId;
-                    opt.textContent = f.name + "  [搜索命中]";
+                    opt.textContent = truncateFolder(f.name, 30) + " [命中]";
                     sel.appendChild(opt);
                 });
                 if (folders.length === 0) {
@@ -830,7 +837,8 @@
                 log("搜到 " + folders.length + " 个文件夹");
                 sel.onchange = () => {
                     const fid = sel.value;
-                    const name = fid ? sel.options[sel.selectedIndex].textContent.replace("  [搜索命中]", "") : "(根目录)";
+                    const full = folders.find(f => f.fileId === fid);
+                    const name = full ? full.name : "(根目录)";
                     setTargetFolder(fid ? { fileId: fid, name } : null);
                     log("目标文件夹: " + name);
                 };
