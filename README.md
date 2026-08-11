@@ -1,0 +1,66 @@
+# 光鸭网盘 - txt 磁力链接批量云添加
+
+油猴(Tampermonkey)脚本:选择本地 txt 文件,自动提取里面的磁力链接/种子 URL,批量云添加到光鸭网盘。
+
+基于光鸭官方 API `cloudcollection/v1` 逆向实现,自动处理鉴权、记忆去重、每日限额。
+
+## 功能
+
+- 📄 **txt 批量导入**:选本地 txt,自动识别磁力链接(magnet / 40hex / 32base32 / .torrent URL / ed2k)
+- 🔑 **自动鉴权**:拦截网页版真实请求头,自动提取 token + did + smid,持久化存储
+- 🧠 **记忆去重**:已成功提交的自动跳过,支持断点续跑
+- ❌ **失败黑名单**:永久失败的磁力链下次不再上传(临时失败如网络/超时自动重试)
+- 📅 **每日限额**:默认每天最多 1000 次(可配置),失败不占名额,成功数满额自动停
+- 📁 **文件夹选择**:搜索或列出光鸭文件夹,选择目标保存位置
+- ⏸ **暂停/继续**:随时暂停上传,恢复后断点继续
+- 💾 **导出/导入记忆**:删脚本前导出备份,重装后导入恢复
+- 🚀 **防卡死**:大文件分片解析、日志批量渲染、记忆内存缓存
+
+## 安装
+
+1. 先给浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)
+2. 把 [guangya-txt-cloud-add.user.js](guangya-txt-cloud-add.user.js) 拖进 Tampermonkey 新建脚本,或复制内容粘贴保存
+3. 打开光鸭网盘网页版并登录
+4. 刷新页面,右下角出现悬浮面板
+
+## 使用
+
+1. **🔍 搜索文件夹**(可选):输入关键字搜索光鸭里的文件夹,选择目标保存位置
+2. **📄 选择 txt 文件**:选你的磁力列表 txt,脚本自动解析
+3. 检查统计信息(已提交跳过/失败跳过/今日额度)
+4. **▶ 开始上传**:确认后开始批量云添加
+5. 上传中可 **⏸ 暂停** / **▶ 继续**
+
+## 参数
+
+| 项 | 说明 | 默认 |
+|---|---|---|
+| `DAILY_LIMIT` | 每日最大提交次数 | 1000 |
+| 限频 | 每个磁力提交间隔 | 1.2 秒 |
+| 记忆存储 | `gy_submitted_map` 等 GM 存储 | 跟随脚本 |
+
+## 原理
+
+脚本通过拦截光鸭网页版的真实 API 请求(`Authorization: Bearer` + `did` + `smid` + `dt` + `traceparent` 头)自动获取鉴权信息,然后直接调用光鸭官方 API:
+
+```
+解析磁力链: POST /cloudcollection/v1/resolve_res
+创建任务:   POST /cloudcollection/v1/create_task
+任务列表:   POST /cloudcollection/v1/list_task
+搜索文件夹: POST /userres/v1/file/search_files
+```
+
+## 注意事项
+
+- 脚本自动从网页版请求头捕获 token,登录后无需手动配置
+- 已提交/失败的磁力链存本地 GM 存储,删脚本前请 **💾 导出记忆** 备份
+- 遵守光鸭每日限额,超限自动停止,次日自动恢复
+
+## 目录
+
+- `guangya-txt-cloud-add.user.js` — 主脚本(完整功能版)
+- `guangya-magnet-autoupload.user.js` — 早期框架版(已废弃,仅作参考)
+
+## License
+
+MIT
