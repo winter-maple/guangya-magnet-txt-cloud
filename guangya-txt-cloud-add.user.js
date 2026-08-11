@@ -630,53 +630,375 @@
         const max = maxLen || 40;
         return s.length > max ? s.slice(0, max) + "…" : s;
     }
+
     function buildUI() {
         if (document.getElementById("gy-txt-panel")) return;
+
+        // 注入苹果风格 CSS 样式表 (包含深色模式、毛玻璃、胶囊按钮、微交互动画)
+        if (!document.getElementById("gy-txt-style")) {
+            const style = document.createElement("style");
+            style.id = "gy-txt-style";
+            style.textContent = `
+                #gy-txt-panel {
+                    position: fixed;
+                    right: 20px;
+                    bottom: 20px;
+                    z-index: 2147483646;
+                    width: 420px;
+                    box-sizing: border-box;
+                    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", Arial, sans-serif;
+                    border-radius: 18px;
+                    background: rgba(255, 255, 255, 0.78);
+                    -webkit-backdrop-filter: blur(25px) saturate(190%);
+                    backdrop-filter: blur(25px) saturate(190%);
+                    border: 1px solid rgba(255, 255, 255, 0.5);
+                    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.15), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+                    color: #1c1c1e;
+                    overflow: hidden;
+                    user-select: none;
+                    transition: box-shadow 0.3s ease, border-color 0.3s ease;
+                }
+                @media (prefers-color-scheme: dark) {
+                    #gy-txt-panel {
+                        background: rgba(32, 32, 36, 0.82);
+                        border: 1px solid rgba(255, 255, 255, 0.15);
+                        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
+                        color: #f2f2f7;
+                    }
+                }
+                #gy-txt-head {
+                    padding: 12px 16px;
+                    background: rgba(255, 255, 255, 0.45);
+                    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    cursor: move;
+                    font-weight: 600;
+                    font-size: 13.5px;
+                    letter-spacing: -0.2px;
+                }
+                @media (prefers-color-scheme: dark) {
+                    #gy-txt-head {
+                        background: rgba(255, 255, 255, 0.05);
+                        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                    }
+                }
+                .gy-apple-header-title {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+                .gy-apple-badge {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 6px;
+                    background: linear-gradient(135deg, #007AFF, #5856D6);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    color: #fff;
+                    font-size: 11px;
+                    font-weight: bold;
+                    box-shadow: 0 2px 5px rgba(0, 122, 255, 0.3);
+                }
+                #gy-txt-close {
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 50%;
+                    background: rgba(120, 120, 128, 0.16);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    cursor: pointer;
+                    font-size: 11px;
+                    color: #8e8e93;
+                    transition: all 0.2s ease;
+                }
+                #gy-txt-close:hover {
+                    background: rgba(255, 59, 48, 0.2);
+                    color: #ff3b30;
+                }
+                .gy-apple-content {
+                    padding: 14px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 10px;
+                    user-select: text;
+                }
+                .gy-apple-btn {
+                    border: none;
+                    border-radius: 10px;
+                    padding: 7px 10px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    transition: all 0.16s cubic-bezier(0.4, 0, 0.2, 1);
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 4px;
+                    outline: none;
+                    line-height: 1.2;
+                    white-space: nowrap;
+                    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+                }
+                .gy-apple-btn:active {
+                    transform: scale(0.96);
+                    opacity: 0.85;
+                }
+                .gy-btn-blue {
+                    background: #007AFF;
+                    color: #ffffff;
+                    box-shadow: 0 2px 8px rgba(0, 122, 255, 0.25);
+                }
+                .gy-btn-blue:hover {
+                    background: #0066CC;
+                }
+                .gy-btn-gray {
+                    background: rgba(120, 120, 128, 0.12);
+                    color: inherit;
+                }
+                .gy-btn-gray:hover {
+                    background: rgba(120, 120, 128, 0.2);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-btn-gray {
+                        background: rgba(255, 255, 255, 0.1);
+                    }
+                    .gy-btn-gray:hover {
+                        background: rgba(255, 255, 255, 0.18);
+                    }
+                }
+                .gy-btn-orange {
+                    background: rgba(255, 149, 0, 0.15);
+                    color: #FF9500;
+                }
+                .gy-btn-orange:hover {
+                    background: rgba(255, 149, 0, 0.25);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-btn-orange {
+                        color: #FF9F0A;
+                    }
+                }
+                .gy-btn-purple {
+                    background: rgba(175, 82, 222, 0.15);
+                    color: #AF52DE;
+                }
+                .gy-btn-purple:hover {
+                    background: rgba(175, 82, 222, 0.25);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-btn-purple {
+                        color: #BF5AF2;
+                    }
+                }
+                .gy-btn-green {
+                    background: rgba(52, 199, 89, 0.15);
+                    color: #34C759;
+                }
+                .gy-btn-green:hover {
+                    background: rgba(52, 199, 89, 0.25);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-btn-green {
+                        color: #30D158;
+                    }
+                }
+                .gy-btn-red {
+                    background: rgba(255, 59, 48, 0.15);
+                    color: #FF3B30;
+                }
+                .gy-btn-red:hover {
+                    background: rgba(255, 59, 48, 0.25);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-btn-red {
+                        color: #FF453A;
+                    }
+                }
+                .gy-btn-main {
+                    width: 100%;
+                    background: linear-gradient(180deg, #007AFF 0%, #0062CC 100%);
+                    color: #ffffff;
+                    font-size: 13.5px;
+                    font-weight: 600;
+                    padding: 10px;
+                    border-radius: 12px;
+                    box-shadow: 0 4px 14px rgba(0, 122, 255, 0.35);
+                    letter-spacing: -0.1px;
+                }
+                .gy-btn-main:hover {
+                    background: linear-gradient(180deg, #0066CC 0%, #004F9E 100%);
+                    box-shadow: 0 6px 18px rgba(0, 122, 255, 0.45);
+                }
+                .gy-btn-pause-style {
+                    width: 100%;
+                    background: #FF9500;
+                    color: #ffffff;
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    padding: 8px;
+                    border-radius: 12px;
+                    box-shadow: 0 3px 10px rgba(255, 149, 0, 0.3);
+                }
+                .gy-apple-input {
+                    background: rgba(255, 255, 255, 0.65);
+                    border: 1px solid rgba(0, 0, 0, 0.1);
+                    border-radius: 10px;
+                    padding: 7px 10px;
+                    font-size: 12px;
+                    color: inherit;
+                    outline: none;
+                    transition: all 0.2s ease;
+                    box-sizing: border-box;
+                    font-family: inherit;
+                }
+                .gy-apple-input:focus {
+                    border-color: #007AFF;
+                    background: #ffffff;
+                    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.18);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-apple-input {
+                        background: rgba(0, 0, 0, 0.3);
+                        border-color: rgba(255, 255, 255, 0.12);
+                    }
+                    .gy-apple-input:focus {
+                        background: rgba(0, 0, 0, 0.5);
+                        border-color: #0A84FF;
+                        box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+                    }
+                }
+                .gy-apple-select {
+                    appearance: none;
+                    -webkit-appearance: none;
+                    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%3C%238e8e93%3E' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+                    background-repeat: no-repeat;
+                    background-position: right 10px center;
+                    padding-right: 24px !important;
+                }
+                .gy-card-box {
+                    background: rgba(120, 120, 128, 0.06);
+                    border-radius: 12px;
+                    padding: 8px 10px;
+                    border: 1px solid rgba(0, 0, 0, 0.03);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .gy-card-box {
+                        background: rgba(255, 255, 255, 0.04);
+                        border-color: rgba(255, 255, 255, 0.06);
+                    }
+                }
+                .gy-progress-track-style {
+                    background: rgba(120, 120, 128, 0.16);
+                    border-radius: 6px;
+                    height: 6px;
+                    overflow: hidden;
+                }
+                .gy-progress-bar-style {
+                    background: linear-gradient(90deg, #34C759, #30D158);
+                    height: 100%;
+                    width: 0%;
+                    border-radius: 6px;
+                    transition: width 0.25s ease;
+                }
+                #gy-txt-log {
+                    max-height: 170px;
+                    overflow-y: auto;
+                    background: rgba(0, 0, 0, 0.03);
+                    border: 1px solid rgba(0, 0, 0, 0.06);
+                    border-radius: 10px;
+                    padding: 8px 10px;
+                    font-size: 11px;
+                    font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                    white-space: pre-wrap;
+                    word-break: break-all;
+                    color: inherit;
+                    line-height: 1.45;
+                }
+                @media (prefers-color-scheme: dark) {
+                    #gy-txt-log {
+                        background: rgba(0, 0, 0, 0.35);
+                        border-color: rgba(255, 255, 255, 0.08);
+                    }
+                }
+                #gy-txt-log::-webkit-scrollbar {
+                    width: 5px;
+                }
+                #gy-txt-log::-webkit-scrollbar-track {
+                    background: transparent;
+                }
+                #gy-txt-log::-webkit-scrollbar-thumb {
+                    background: rgba(120, 120, 128, 0.3);
+                    border-radius: 3px;
+                }
+                #gy-txt-log::-webkit-scrollbar-thumb:hover {
+                    background: rgba(120, 120, 128, 0.5);
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
         const panel = document.createElement("div");
         panel.id = "gy-txt-panel";
-        panel.style.cssText = "position:fixed;right:20px;bottom:20px;z-index:2147483646;width:420px;background:#fff;border:1px solid #d0d7de;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.25);font:13px system-ui;color:#24292f;";
         panel.innerHTML = `
-            <div id="gy-txt-head" style="padding:10px 14px;background:linear-gradient(135deg,#00b96b,#2e8b57);color:#fff;border-radius:10px 10px 0 0;font-weight:600;cursor:move;display:flex;justify-content:space-between;align-items:center;">
-                <span>光鸭网盘 - txt 磁力批量云添加</span>
-                <span id="gy-txt-close" style="cursor:pointer;font-size:16px;">✕</span>
+            <div id="gy-txt-head">
+                <div class="gy-apple-header-title">
+                    <div class="gy-apple-badge">☁</div>
+                    <span>光鸭网盘 - txt 磁力批量云添加</span>
+                </div>
+                <span id="gy-txt-close" title="关闭">✕</span>
             </div>
-            <div style="padding:12px;">
-                <div style="display:flex;gap:8px;margin-bottom:10px;">
-                    <button id="gy-txt-pick" style="flex:1;background:#00b96b;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;font-weight:600;">📄 选择 txt 文件</button>
-                    <button id="gy-txt-token" style="background:#57606a;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;">🔑 设置Token</button>
-                    <button id="gy-txt-verify" style="background:#e8a838;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;">🧪 验证Token</button>
-                    <button id="gy-txt-mem" style="background:#8250df;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;">🧠 记忆状态</button>
+            <div class="gy-apple-content">
+                <!-- 工具栏第一行按钮 -->
+                <div style="display:flex;gap:6px;">
+                    <button id="gy-txt-pick" class="gy-apple-btn gy-btn-blue" style="flex:1;">📄 选择txt文件</button>
+                    <button id="gy-txt-token" class="gy-apple-btn gy-btn-gray">🔑 设置Token</button>
+                    <button id="gy-txt-verify" class="gy-apple-btn gy-btn-orange">🧪 验证Token</button>
+                    <button id="gy-txt-mem" class="gy-apple-btn gy-btn-purple">🧠 记忆状态</button>
                 </div>
-                <div style="display:flex;gap:8px;margin-bottom:10px;">
-                    <button id="gy-txt-export" style="flex:1;background:#cf222e;color:#fff;border:none;border-radius:6px;padding:6px;cursor:pointer;font-size:12px;">💾 导出记忆</button>
-                    <button id="gy-txt-import" style="flex:1;background:#1a7f37;color:#fff;border:none;border-radius:6px;padding:6px;cursor:pointer;font-size:12px;">📥 导入记忆</button>
+                <!-- 工具栏第二行按钮 -->
+                <div style="display:flex;gap:6px;">
+                    <button id="gy-txt-export" class="gy-apple-btn gy-btn-red" style="flex:1;">💾 导出记忆</button>
+                    <button id="gy-txt-import" class="gy-apple-btn gy-btn-green" style="flex:1;">📥 导入记忆</button>
                 </div>
-                <div style="margin-bottom:10px;">
-                    <button id="gy-txt-start" style="width:100%;background:#e60039;color:#fff;border:none;border-radius:6px;padding:10px;cursor:pointer;font-weight:700;font-size:14px;box-shadow:0 2px 8px rgba(230,0,57,.3);">▶ 开始上传(选择文件后点此执行)</button>
-                    <button id="gy-txt-pause" style="width:100%;background:#9a6700;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;font-weight:600;font-size:13px;margin-top:6px;display:none;">⏸ 暂停上传</button>
+                <!-- 开始与暂停上传 -->
+                <div>
+                    <button id="gy-txt-start" class="gy-apple-btn gy-btn-main">▶ 开始上传</button>
+                    <button id="gy-txt-pause" class="gy-apple-btn gy-btn-pause-style" style="margin-top:6px;display:none;">⏸ 暂停上传</button>
                 </div>
-                <div style="display:flex;gap:8px;margin-bottom:6px;align-items:center;">
-                    <input id="gy-txt-search" type="text" placeholder="🔍 搜索文件夹(回车搜索)..." style="flex:1;padding:8px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;">
-                    <button id="gy-txt-search-btn" style="background:#0969da;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;white-space:nowrap;">搜索</button>
+                <!-- 文件夹搜索区 -->
+                <div style="display:flex;gap:6px;align-items:center;">
+                    <input id="gy-txt-search" type="text" class="gy-apple-input" placeholder="🔍 搜索文件夹(回车搜索)..." style="flex:1;">
+                    <button id="gy-txt-search-btn" class="gy-apple-btn gy-btn-gray" style="white-space:nowrap;">搜索</button>
                 </div>
-                <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;">
-                    <select id="gy-txt-folder" style="flex:1;padding:8px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;max-width:280px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;box-sizing:border-box;">
+                <!-- 文件夹选择下拉框 -->
+                <div style="display:flex;gap:6px;align-items:center;">
+                    <select id="gy-txt-folder" class="gy-apple-input gy-apple-select" style="flex:1;min-width:0;max-width:275px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
                         <option value="">(根目录)</option>
                     </select>
-                    <button id="gy-txt-folder-btn" style="background:#0969da;color:#fff;border:none;border-radius:6px;padding:8px;cursor:pointer;white-space:nowrap;">📁 全部文件夹</button>
+                    <button id="gy-txt-folder-btn" class="gy-apple-btn gy-btn-gray" style="white-space:nowrap;">📁 全部文件夹</button>
                 </div>
+                <!-- 隐藏的文件选择 input -->
                 <input id="gy-txt-file" type="file" accept=".txt,.text,.m3u,.csv,text/plain" style="display:none;">
-                <div id="gy-txt-info" style="margin-bottom:8px;font-size:12px;color:#57606a;">未选择文件</div>
-                <div style="margin-bottom:8px;font-size:12px;color:#57606a;">
-                    识别规则:磁力链接 magnet:、40位hex、32位base32、.torrent URL、ed2k 链接。每行一个。
-                </div>
-                <div id="gy-txt-progress" style="margin-bottom:8px;display:none;">
-                    <div style="background:#eee;border-radius:4px;height:8px;overflow:hidden;">
-                        <div id="gy-txt-bar" style="background:#00b96b;height:100%;width:0;transition:width .2s;"></div>
+                <!-- 状态与规则提示 -->
+                <div class="gy-card-box">
+                    <div id="gy-txt-info" style="font-size:12px;font-weight:500;margin-bottom:2px;">未选择文件</div>
+                    <div style="font-size:11px;color:#8e8e93;line-height:1.35;">
+                        规则: 磁力链接 magnet:、40位hex、32位base32、.torrent URL、ed2k 链接。每行一个。
                     </div>
-                    <div id="gy-txt-count" style="margin-top:4px;font-size:12px;color:#57606a;"></div>
                 </div>
-                <div id="gy-txt-log" style="max-height:200px;overflow-y:auto;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:8px;font-size:12px;font-family:ui-monospace,monospace;white-space:pre-wrap;"></div>
+                <!-- 进度条 -->
+                <div id="gy-txt-progress" style="display:none;">
+                    <div class="gy-progress-track-style">
+                        <div id="gy-txt-bar" class="gy-progress-bar-style"></div>
+                    </div>
+                    <div id="gy-txt-count" style="margin-top:4px;font-size:11px;color:#8e8e93;text-align:right;"></div>
+                </div>
+                <!-- 日志区 -->
+                <div id="gy-txt-log"></div>
             </div>`;
         document.body.appendChild(panel);
 
@@ -913,12 +1235,12 @@
             if (!_pauseRequested) {
                 pauseUpload();
                 pauseBtn.textContent = "▶ 继续上传";
-                pauseBtn.style.background = "#1a7f37";
+                pauseBtn.style.background = "#34C759";
                 log("⏸ 已暂停(当前请求完成/中断后停止,点「继续上传」恢复)");
             } else {
                 resumeUpload();
                 pauseBtn.textContent = "⏸ 暂停上传";
-                pauseBtn.style.background = "#9a6700";
+                pauseBtn.style.background = "#FF9500";
                 log("▶ 已继续上传");
             }
         };
