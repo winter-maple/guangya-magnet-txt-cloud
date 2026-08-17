@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name        光鸭网盘 - txt 磁力链接批量云添加
 // @namespace   winter-maple
-// @version      1.0.0
-// @description 选择本地 txt 文件,自动提取里面的磁力链接/种子URL,批量云添加到光鸭网盘。基于光鸭官方 API cloudcollection/v1。
+// @version      1.1.0
+// @description 选择本地 txt 文件,自动提取里面的磁力链接/种子URL,批量云添加到光鸭网盘。基于光鸭官方 API cloudcollection/v1。v1.1: 并发提交 + 自适应退避 + 临时失败重试 + 限额可配置 + 页面抓取。
 // @author      winter-maple
 // @match       *://*.guangyapan.com/*
 // @grant       GM_setValue
@@ -34,8 +34,20 @@
     const KEY_TARGET_FOLDER = "gy_target_folder";   // {fileId, name} 目标文件夹
     const KEY_FAILED_MAP = "gy_failed_map";         // {hash: {reason, ts}} 永久失败黑名单
 
-    // 每日限额(光鸭每天最多提交次数,可配置)
-    const DAILY_LIMIT = 1000;
+    // 每日限额(光鸭每天最多提交次数,可在 UI 修改;默认 1000)
+    const KEY_LIMIT = "gy_daily_limit";
+    function getDailyLimit() {
+        try {
+            const v = Number(GM_getValue(KEY_LIMIT, 1000));
+            return (v > 0 && v <= 100000) ? v : 1000;
+        } catch (e) { return 1000; }
+    }
+    function setDailyLimit(n) {
+        try { GM_setValue(KEY_LIMIT, n); } catch (e) { /* ignore */ }
+    }
+    function todayLimitReached() {
+        return getTodayCount() >= getDailyLimit();
+    }
 
     /* ============================================================
      * 记忆系统 — 已提交磁力链记忆 + 每日限额
@@ -107,12 +119,12 @@
         return t ? (t.count || 0) : 0;
     }
     function todayLimitReached() {
-        return getTodayCount() >= DAILY_LIMIT;
+        return getTodayCount() >= getDailyLimit();
     }
     function bumpDailyCount() {
         const d = getDaily();
         const t = d[todayStr()];
-        d[todayStr()] = { count: (t ? t.count : 0) + 1, limit: DAILY_LIMIT };
+        d[todayStr()] = { count: (t ? t.count : 0) + 1, limit: getDailyLimit() };
         try { GM_setValue(KEY_DAILY, d); } catch (e) { /* ignore */ }
     }
     function getTotalSubmitted() {
@@ -963,6 +975,13 @@
                 <div style="display:flex;gap:6px;">
                     <button id="gy-txt-export" class="gy-apple-btn gy-btn-red" style="flex:1;">💾 导出记忆</button>
                     <button id="gy-txt-import" class="gy-apple-btn gy-btn-green" style="flex:1;">📥 导入记忆</button>
+                    <button id="gy-txt-page" class="gy-apple-btn gy-btn-purple" style="flex:1;">🔍 抓取本页</button>
+                </div>
+                <!-- 每日限额设置 -->
+                <div style="display:flex;gap:6px;align-items:center;">
+                    <span style="font-size:11px;color:#8e8e93;white-space:nowrap;">每日限额</span>
+                    <input id="gy-txt-limit" type="number" min="1" max="100000" value="" class="gy-apple-input" style="flex:1;min-width:0;" title="光鸭每天最多提交次数">
+                    <button id="gy-txt-limit-btn" class="gy-apple-btn gy-btn-gray" style="white-space:nowrap;">保存</button>
                 </div>
                 <!-- 开始与暂停上传 -->
                 <div>
@@ -1053,8 +1072,8 @@
             const total = getTotalSubmitted();
             const failedCount = Object.keys(getFailedMap()).length;
             log("=== 记忆状态 ===");
-            log("今日已用: " + today + "/" + DAILY_LIMIT);
-            log("今日剩余: " + Math.max(0, DAILY_LIMIT - today));
+            log("今日已用: " + today + "/" + getDailyLimit());
+            log("今日剩余: " + Math.max(0, getDailyLimit() - today));
             log("已成功记忆: " + submitted + " 个");
             log("永久失败黑名单: " + failedCount + " 个");
             log("历史累计提交: " + total + " 次");
@@ -1092,6 +1111,44 @@
             e.target.value = "";
         };
         document.getElementById("gy-txt-import").onclick = () => importInput.click();
+        // 每日限额:显示当前值 + 保存
+        const limitInput = document.getElementById("gy-txt-limit");
+        const limitBtn = document.getElementById("gy-txt-limit-btn");
+        limitInput.value = getDailyLimit();
+        limitBtn.onclick = () => {
+            const v = parseInt(limitInput.value, 10);
+            if (!(v > 0 && v <= 100000)) {
+                log("✗ 限额必须是 1-100000 的整数");
+                limitInput.value = getDailyLimit();
+                return;
+            }
+            setDailyLimit(v);
+            log("✓ 每日限额已设为 " + v + "(今日已用 " + getTodayCount() + ", 剩余 " + Math.max(0, v - getTodayCount()) + ")");
+        };
+        // 抓取本页:扫描当前页面 DOM 里的 magnet/hash/.torrent 链接
+        document.getElementById("gy-txt-page").onclick = () => {
+            const found = new Set();
+            const src = document.documentElement.outerHTML;
+            // 全链 magnet
+            const mm = src.matchAll(/magnet:\?xt=urn:btih:[0-9a-fA-F]{32,40}/g);
+            for (const m of mm) found.add(m[0]);
+            // 40hex / 32base32(独立 token,排除 HTML 属性碎片)
+            const h40 = src.matchAll(/\b[0-9a-fA-F]{40}\b/g);
+            for (const m of h40) found.add("magnet:?xt=urn:btih:" + m[0].toUpperCase());
+            // .torrent URL
+            const tu = src.matchAll(/https?:\/\/[^\s"'<>]+\.torrent(?:[?#][^\s"'<>]*)?/gi);
+            for (const m of tu) found.add(m[0]);
+            const list = [...found];
+            log("本页抓取: 识别到 " + list.length + " 个磁力/种子");
+            if (list.length === 0) { log("⚠ 本页未发现磁力链接"); return; }
+            list.slice(0, 5).forEach((m, i) => log((i + 1) + ". " + m.slice(0, 70)));
+            if (list.length > 5) log("... 共 " + list.length + " 个");
+            pendingMagnets = list;
+            const todayUsed = getTodayCount();
+            const remaining = Math.max(0, getDailyLimit() - todayUsed);
+            log("今日已用 " + todayUsed + "/" + getDailyLimit() + ", 剩余 " + remaining);
+            log("▶ 确认无误后点「开始上传」执行");
+        };
         document.getElementById("gy-txt-folder-btn").onclick = async () => {
             let token = getAccessToken();
             if (!token) {
@@ -1199,11 +1256,11 @@
             // 记忆过滤:预览将跳过多少已提交
             const alreadyDone = magnets.filter(m => isSubmitted(magnetHash(m)));
             const todayUsed = getTodayCount();
-            const remaining = Math.max(0, DAILY_LIMIT - todayUsed);
+            const remaining = Math.max(0, getDailyLimit() - todayUsed);
             pendingMagnets = magnets;
 
             log("已提交跳过: " + alreadyDone.length + " 个");
-            log("今日已用 " + todayUsed + "/" + DAILY_LIMIT + ", 剩余 " + remaining);
+            log("今日已用 " + todayUsed + "/" + getDailyLimit() + ", 剩余 " + remaining);
             log("本次待提交(最多 " + Math.min(remaining, magnets.length - alreadyDone.length) + " 个)");
             // 只显示前 5 个预览
             magnets.slice(0, 5).forEach((m, i) => log((i + 1) + ". " + m.slice(0, 70)));
@@ -1218,7 +1275,7 @@
                 return;
             }
             const n = pendingMagnets.length;
-            const ok = confirm("确认开始上传 " + n + " 个磁力链?\n\n将自动跳过已提交的,并遵守今日 1000 上限。");
+            const ok = confirm("确认开始上传 " + n + " 个磁力链?\n\n将自动跳过已提交的,并遵守今日 " + getDailyLimit() + " 上限。");
             if (!ok) { log("已取消"); return; }
             const list = pendingMagnets;
             pendingMagnets = [];   // 防重复点击
@@ -1311,19 +1368,15 @@
             if (!token) { log("✗ 未提供 token,取消"); return; }
             setToken(token);
         }
-
-        // 认证曾失效:提示刷新页面重新捕获,避免用空 token 狂打
         if (isAuthFailed()) {
             log("⚠ 上次 token 已失效。请刷新页面(脚本会自动捕获新 token)后重试。");
             return;
         }
-
         log("Token: " + token.slice(0, 8) + "...");
 
         // === 记忆过滤:跳过已提交 + 永久失败黑名单 ===
-        // 一次遍历完成分类(每个磁力只算一次 hash),避免三次 filter 重复计算
         const todayUsed = getTodayCount();
-        const remainingToday = Math.max(0, DAILY_LIMIT - todayUsed);
+        const remainingToday = Math.max(0, getDailyLimit() - todayUsed);
         const alreadyDone = [];
         const alreadyFailed = [];
         const pending = [];
@@ -1333,108 +1386,121 @@
             else if (isFailed(h)) alreadyFailed.push(m);
             else pending.push(m);
         }
-
-        log("今日已用 " + todayUsed + "/" + DAILY_LIMIT + " (剩 " + remainingToday + ")");
+        log("今日已用 " + todayUsed + "/" + getDailyLimit() + " (剩 " + remainingToday + ")");
         log("本次识别 " + magnets.length + " 个, 已提交跳过 " + alreadyDone.length + " 个, 永久失败跳过 " + alreadyFailed.length + " 个, 待提交 " + pending.length + " 个");
 
         if (pending.length === 0) { log("全部已提交/失败过,无需操作"); return; }
         if (remainingToday <= 0) { log("✗ 今日额度已用完,明天再跑。今日剩余: 0"); return; }
 
-        // 目标文件夹
         const targetFolder = getTargetFolder();
         const parentId = (targetFolder && targetFolder.fileId) || "";
-        if (parentId) {
-            log("目标文件夹: " + targetFolder.name + " (ID " + parentId + ")");
-        } else {
-            log("目标文件夹: (根目录)");
+        if (parentId) log("目标文件夹: " + targetFolder.name + " (ID " + parentId + ")");
+        else log("目标文件夹: (根目录)");
+
+        // === v1.1: 并发池 + 自适应退避 + 临时失败重试 ===
+        const MAX_CONCURRENCY = 3;      // 初始并发
+        const MIN_CONCURRENCY = 1;
+        let concurrency = MAX_CONCURRENCY;
+        const quota = remainingToday;
+        const total = pending.length;
+        let ok = 0, fail = 0, done = 0;
+        let stopped = false;
+        const failReasons = {};
+        const seenThisRun = new Set();
+        const queue = [...pending];
+
+        // 带退避的重试包装:临时失败(网络/超时/429)自动重试 attempts-1 次
+        async function withRetry(fn, baseDelay, label) {
+            let delay = baseDelay;
+            for (let attempt = 1; ; attempt++) {
+                try {
+                    return await fn();
+                } catch (e) {
+                    const msg = e.message || "未知异常";
+                    const temp = isTempFailure(msg);
+                    if (!temp || attempt >= 3) throw e;
+                    log("↻ " + label + " 重试 " + attempt + "/2 (" + msg + ")");
+                    await new Promise(r => setTimeout(r, delay));
+                    delay *= 2;   // 500ms -> 1s -> 2s
+                }
+            }
         }
 
-        // 失败不占名额:跑完全部 pending,只要成功数 < 今日剩余就继续。
-        // 成功数达到 remainingToday 才停(满额),否则跑到磁力耗尽。
-        const toSubmit = pending;   // 全部待提交的
-        const quota = remainingToday;
-        setProgress(0, "开始提交 0/" + toSubmit.length);
-
-        let ok = 0, fail = 0;
-        // 批量统计:不逐条刷日志,避免几万条卡死 UI
-        const failReasons = {};
-        const seenThisRun = new Set();   // 本轮已处理过的 hash,防同一 txt 内重复磁力重复提交
-        for (let i = 0; i < toSubmit.length; i++) {
-            const m = toSubmit[i];
-            const hash = magnetHash(m);
-            // 同一轮内已处理过的重复磁力 → 跳过,防重复上传
-            if (seenThisRun.has(hash)) {
-                log("⏭ 跳过重复 [" + (i + 1) + "]: " + m.slice(0, 50));
-                continue;
-            }
-            seenThisRun.add(hash);
-            // 成功数满额即停(失败不占名额,只按成功算)
-            if (ok >= quota) {
-                log("✓ 今日成功数已达 " + quota + ", 停止。剩余磁力明天再跑(记忆断点已保存)");
-                break;
-            }
-            // 每 10 条更新一次进度(减少 DOM 写入)
-            if (i % 10 === 0 || i === toSubmit.length - 1) {
-                setProgress(Math.round(i / toSubmit.length * 100), "提交 " + (i + 1) + "/" + toSubmit.length + " (成功 " + ok + "/" + quota + " 失败 " + fail + ")");
-            }
-            // token 中途失效立即中断,不浪费剩余请求
-            if (isAuthFailed()) {
-                log("⚠ token 已失效,中断上传。请刷新页面重新捕获后继续(记忆已断点保存)。");
-                break;
-            }
-            // 暂停检查:暂停时挂起,恢复后继续
-            await waitIfPaused();
-            try {
-                // 1. 解析磁力链
-                const rr = await resolveUrl(m, token);
-                if (rr.status !== 200 || (rr.body && rr.body.code !== 0 && rr.body.code != null)) {
-                    const msg = (rr.body && (rr.body.msg || rr.body.message)) || ("HTTP " + rr.status);
-                    fail++;
-                    failReasons["解析失败: " + msg] = (failReasons["解析失败: " + msg] || 0) + 1;
-                    if (!isTempFailure(msg)) markFailed(hash, "解析失败: " + msg);   // 永久失败记黑名单
-                    log("✗ 解析失败 [" + (i + 1) + "]: " + m.slice(0, 50) + " → " + msg);
-                    // 服务端额度超限 → 立即停止
-                    if (isQuotaExceeded(msg)) {
-                        log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
-                        break;
-                    }
-                    await new Promise(r => setTimeout(r, 800));
+        async function worker() {
+            while (!stopped && queue.length > 0) {
+                const m = queue.shift();
+                const hash = magnetHash(m);
+                if (seenThisRun.has(hash)) {
+                    log("⏭ 跳过重复: " + m.slice(0, 50));
+                    done++;
                     continue;
                 }
-                // 2. 创建任务(带目标文件夹)
-                const ct = await createTask(m, token, { parentId });
-                const cbody = ct.body && typeof ct.body === "object" ? ct.body : null;
-                const ccode = cbody ? cbody.code : null;
-                // 成功判定:code===0,或 body 是对象且无 code 且 HTTP 200(某些成功响应无 code 字段)
-                if (ccode === 0 || (cbody && ccode == null && ct.status === 200)) {
-                    ok++;
-                    markSubmitted(hash);   // 记忆:记录已提交
-                    bumpDailyCount();      // 记忆:每日计数+1
-                    bumpTotal();           // 记忆:总数+1
-                    log("✓ 已添加 [" + (i + 1) + "]: " + m.slice(0, 60));
-                } else {
-                    const msg = (cbody && (cbody.msg || cbody.message)) || ("HTTP " + ct.status);
-                    fail++;
-                    failReasons[msg] = (failReasons[msg] || 0) + 1;
-                    if (!isTempFailure(msg)) markFailed(hash, msg);   // 永久失败记黑名单
-                    log("✗ 添加失败 [" + (i + 1) + "]: " + m.slice(0, 50) + " → " + msg);
-                    // 服务端额度超限 → 立即停止,不继续浪费请求
-                    if (isQuotaExceeded(msg)) {
-                        log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
-                        break;
+                seenThisRun.add(hash);
+                if (ok >= quota) { stopped = true; break; }
+                if (isAuthFailed()) { stopped = true; break; }
+                await waitIfPaused();
+
+                try {
+                    // 1. 解析磁力链(临时失败自动重试)
+                    const rr = await withRetry(() => resolveUrl(m, token), 500, "解析");
+                    if (rr.status !== 200 || (rr.body && rr.body.code !== 0 && rr.body.code != null)) {
+                        const msg = (rr.body && (rr.body.msg || rr.body.message)) || ("HTTP " + rr.status);
+                        fail++;
+                        failReasons["解析失败: " + msg] = (failReasons["解析失败: " + msg] || 0) + 1;
+                        if (!isTempFailure(msg)) markFailed(hash, "解析失败: " + msg);
+                        log("✗ 解析失败: " + m.slice(0, 50) + " → " + msg);
+                        if (isQuotaExceeded(msg)) {
+                            log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
+                            stopped = true; break;
+                        }
+                        if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
+                        done++;
+                        continue;
                     }
+                    // 2. 创建任务(临时失败自动重试)
+                    const ct = await withRetry(() => createTask(m, token, { parentId }), 500, "提交");
+                    const cbody = ct.body && typeof ct.body === "object" ? ct.body : null;
+                    const ccode = cbody ? cbody.code : null;
+                    if (ccode === 0 || (cbody && ccode == null && ct.status === 200)) {
+                        ok++;
+                        markSubmitted(hash);
+                        bumpDailyCount();
+                        bumpTotal();
+                        if (concurrency < MAX_CONCURRENCY) concurrency++;   // 恢复并发
+                        log("✓ 已添加: " + m.slice(0, 60));
+                    } else {
+                        const msg = (cbody && (cbody.msg || cbody.message)) || ("HTTP " + ct.status);
+                        fail++;
+                        failReasons[msg] = (failReasons[msg] || 0) + 1;
+                        if (!isTempFailure(msg)) markFailed(hash, msg);
+                        log("✗ 添加失败: " + m.slice(0, 50) + " → " + msg);
+                        if (isQuotaExceeded(msg)) {
+                            log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
+                            stopped = true; break;
+                        }
+                        if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
+                    }
+                } catch (e) {
+                    const msg = e.message || "未知异常";
+                    fail++;
+                    failReasons["异常: " + msg] = (failReasons["异常: " + msg] || 0) + 1;
+                    if (!isTempFailure(msg)) markFailed(hash, "异常: " + msg);
+                    log("✗ 异常: " + m.slice(0, 50) + " → " + msg);
                 }
-                await new Promise(r => setTimeout(r, 1200)); // 限频
-            } catch (e) {
-                const msg = e.message || "未知异常";
-                fail++;
-                failReasons["异常: " + msg] = (failReasons["异常: " + msg] || 0) + 1;
-                if (!isTempFailure(msg)) markFailed(hash, "异常: " + msg);   // 永久失败记黑名单
-                log("✗ 异常 [" + (i + 1) + "]: " + m.slice(0, 50) + " → " + msg);
-                await new Promise(r => setTimeout(r, 800));
+                done++;
+                if (done % 5 === 0 || done === total) {
+                    setProgress(Math.round(done / total * 100), "提交 " + done + "/" + total + " (成功 " + ok + "/" + quota + " 失败 " + fail + ")");
+                }
+                await new Promise(r => setTimeout(r, 400));   // 基础间隔,防洪峰
             }
         }
-        // 汇总失败原因(代替逐条刷日志)
+
+        setProgress(0, "开始提交 0/" + total);
+        const workers = [];
+        for (let w = 0; w < concurrency; w++) workers.push(worker());
+        await Promise.all(workers);
+
+        // 汇总失败原因
         const reasonLines = Object.entries(failReasons)
             .sort((a, b) => b[1] - a[1])
             .slice(0, 10)
@@ -1445,12 +1511,11 @@
         }
         setProgress(100, "完成: 成功 " + ok + " / 失败 " + fail);
         log("=== 完成: 成功 " + ok + " / 失败 " + fail + " ===");
-        log("今日已用 " + getTodayCount() + "/" + DAILY_LIMIT + ", 剩余 " + Math.max(0, DAILY_LIMIT - getTodayCount()));
-        flushSubmitted();   // 确保最后一批记忆立即写入
-        flushFailedMap();   // 确保失败黑名单立即写入
+        log("今日已用 " + getTodayCount() + "/" + getDailyLimit() + ", 剩余 " + Math.max(0, getDailyLimit() - getTodayCount()));
+        flushSubmitted();
+        flushFailedMap();
         log("记忆已保存,下次运行自动跳过已提交/失败的");
     }
-
     // 挂载
     const inject = () => {
         if (location.hostname.includes("guangyapan.com")) {
@@ -1468,7 +1533,7 @@
             getSubmittedMap, isSubmitted, markSubmitted,
             getTodayCount, todayLimitReached, getTotalSubmitted,
             clearAllMemory, todayStr,
-            dailyLimit: DAILY_LIMIT,
+            dailyLimit: getDailyLimit(),
         },
         failed: {
             getFailedMap, isFailed, markFailed, isTempFailure,
