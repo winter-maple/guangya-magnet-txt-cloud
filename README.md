@@ -60,11 +60,6 @@
 - 已提交/失败的磁力链存本地 GM 存储,删脚本前请 **💾 导出记忆** 备份
 - 遵守光鸭每日限额,超限自动停止,次日自动恢复
 
-## 目录
-
-- `guangya-txt-cloud-add.user.js` — 主脚本(完整功能版)
-- `guangya-magnet-autoupload.user.js` — 早期框架版(已废弃,仅作参考)
-
 ## License
 
 MIT
