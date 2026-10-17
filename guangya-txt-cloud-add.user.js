@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name        光鸭网盘 - txt 磁力链接批量云添加
 // @namespace   winter-maple
-// @version      1.1.0
-// @description 选择本地 txt 文件,自动提取里面的磁力链接/种子URL,批量云添加到光鸭网盘。基于光鸭官方 API cloudcollection/v1。v1.1: 并发提交 + 自适应退避 + 临时失败重试 + 限额可配置 + 页面抓取。
+// @version      1.2.0
+// @description 选择本地 txt 文件,自动提取里面的磁力链接/种子URL,批量云添加到光鸭网盘。基于光鸭官方 API cloudcollection/v1。v1.2: 修复并发退避失效/base32 漏识别/token 手动设置无效/5xx 误拉黑/请求无超时;大文件流式解析;文件夹分页;面板可重开。
 // @author      winter-maple
 // @match       *://*.guangyapan.com/*
+// @run-at      document-start
+// @noframes
 // @grant       GM_setValue
 // @grant       GM_getValue
 // @grant       GM_xmlhttpRequest
 // @connect     api.guangyapan.com
-// @connect     *
 // ==/UserScript==
 
 (function () {
@@ -26,6 +27,10 @@
     const URL_SEARCH = API_BASE + "/userres/v1/file/search_files";       // 全局搜索(文件夹)
 
     const KEY_TOKEN = "gy_token";
+
+    // 单次请求超时:没有它时挂起的请求会让 worker 永久 await,整批卡死
+    const REQUEST_TIMEOUT_MS = 15000;
+    const SUBMIT_INTERVAL_MS = 400;
 
     // 记忆存储 key
     const KEY_SUBMITTED_MAP = "gy_submitted_map";   // hash -> timestamp(已成功提交的磁力链)
@@ -59,16 +64,18 @@
     }
 
     // 从磁力链提取稳定哈希(info_hash),用于去重记忆
+    // hex 统一小写、base32 统一大写,保证同一 hash 的不同写法命中同一条记忆
     function magnetHash(magnet) {
         const s = String(magnet || "");
-        // magnet:?xt=urn:btih:HASH
         const m1 = s.match(/urn:btih:([0-9a-fA-F]{32,40})/i);
-        if (m1) return m1[1].toUpperCase();
-        // 纯 40hex / 32base32
-        const m2 = s.match(/\b([0-9a-fA-F]{40})\b/i);
-        if (m2) return m2[1].toUpperCase();
+        if (m1) {
+            const h = m1[1];
+            return h.length === 32 ? h.toUpperCase() : h.toLowerCase();
+        }
+        const m2 = s.match(/\b([0-9a-fA-F]{40})\b/);
+        if (m2) return m2[1].toLowerCase();
         const m3 = s.match(/\b([A-Z2-7]{32})\b/i);
-        if (m3) return m3[1];
+        if (m3) return m3[1].toUpperCase();
         // .torrent URL 用 URL 本身
         if (/^https?:\/\//i.test(s)) return "url:" + s;
         return "raw:" + s;
@@ -143,6 +150,10 @@
         _failTimer = null;
         _failDirty = false;
         _failMap = {};
+        // 内存里的鉴权状态也要清,否则界面显示已清空但请求仍用旧 token
+        capturedToken = "";
+        capturedAuth = { did: "", smid: "" };
+        _authFailed = false;
         try {
             GM_setValue(KEY_SUBMITTED_MAP, {});
             GM_setValue(KEY_DAILY, {});
@@ -155,13 +166,16 @@
     /* ============================================================
      * 失败黑名单 — 永久失败的磁力链下次不再上传
      * ============================================================ */
-    // 临时失败特征(网络/超时/限频):不记黑名单,下次可重试
-    const TEMP_FAIL_RE = /网络|timeout|超时|429|限频|速率|rate|timed out|ETIMEDOUT|ECONN|socket|proxy|连接|中断|暂时|稍后|太频繁/i;
+    // 临时失败特征(网络/超时/限频/5xx):不记黑名单,下次可重试
+    const TEMP_FAIL_RE = /网络|timeout|超时|429|限频|速率|rate|timed out|ETIMEDOUT|ECONN|socket|proxy|连接|中断|暂时|稍后|太频繁|频繁|请求过多|服务繁忙|服务异常|系统繁忙|稍后再试|\b5\d\d\b/i;
     // 今日额度超限(服务端硬限额,应立即停止)
-    const QUOTA_FAIL_RE = /超限|次数已用|次数不足|额度|quota|limit|每日|自然日|明天|已达上限/i;
+    // 注意不要用裸 "limit":英文 "rate limit" 属于临时限频,必须排除
+    const QUOTA_FAIL_RE = /超限|次数已用|次数不足|次数用完|额度|quota|每日|自然日|明天|已达上限|达到上限|上限已满/i;
 
     function isTempFailure(msg) {
-        return TEMP_FAIL_RE.test(String(msg || ""));
+        const s = String(msg || "");
+        if (isQuotaExceeded(s)) return false;   // 额度类优先,避免被 rate/limit 误判成临时失败
+        return TEMP_FAIL_RE.test(s);
     }
     function isQuotaExceeded(msg) {
         return QUOTA_FAIL_RE.test(String(msg || ""));
@@ -170,6 +184,7 @@
     let _failMap = null;
     let _failDirty = false;
     let _failTimer = null;
+    const FAIL_MAP_MAX = 50000;   // 黑名单上限,超出淘汰最旧条目,防止 GM 存储无限膨胀
     function loadFailMap() {
         if (_failMap) return _failMap;
         try { _failMap = GM_getValue(KEY_FAILED_MAP, {}) || {}; }
@@ -192,6 +207,11 @@
     function markFailed(hash, reason) {
         const m = loadFailMap();
         m[hash] = { reason: String(reason || "").slice(0, 200), ts: Date.now() };
+        const keys = Object.keys(m);
+        if (keys.length > FAIL_MAP_MAX) {
+            keys.sort((a, b) => (m[a].ts || 0) - (m[b].ts || 0));
+            for (let i = 0; i < keys.length - FAIL_MAP_MAX; i++) delete m[keys[i]];
+        }
         _failDirty = true;
         if (_failTimer) clearTimeout(_failTimer);
         _failTimer = setTimeout(flushFailedMap, 3000);   // 3 秒攒一批,写一次
@@ -268,57 +288,82 @@
     }
 
     // 列出某个文件夹下的一级文件夹(不递归,轻量)
+    // 分页拉取:pageSize 是服务端上限,超出会漏,这里循环到空页或满 MAX_FOLDER_PAGES
+    const MAX_FOLDER_PAGES = 20;
     async function listFoldersUnder(token, parentId) {
-        const r = await apiPost(URL_FILE_LIST, {
-            parentId: parentId || "",
-            page: 0,
-            pageSize: 500,
-            orderBy: 0,
-            sortType: 0,
-            resType: 2,   // 只列目录
-        }, token);
-        if (r.status !== 200) throw new Error("HTTP " + r.status);
-        const body = r.body;
-        if (body && body.code !== 0 && body.code != null) {
-            throw new Error((body.msg || body.message) || "code " + body.code);
+        const out = [];
+        const seen = new Set();
+        for (let page = 0; page < MAX_FOLDER_PAGES; page++) {
+            const r = await apiPost(URL_FILE_LIST, {
+                parentId: parentId || "",
+                page: page,
+                pageSize: 500,
+                orderBy: 0,
+                sortType: 0,
+                resType: 2,   // 只列目录
+            }, token);
+            if (r.status !== 200) throw new Error("HTTP " + r.status);
+            const body = r.body;
+            if (body && body.code !== 0 && body.code != null) {
+                throw new Error((body.msg || body.message) || "code " + body.code);
+            }
+            let data = body;
+            if (body && typeof body === "object" && body.data && typeof body.data === "object") data = body.data;
+            const items = (data && (data.list || data.files || data.items || data.records)) || [];
+            let added = 0;
+            for (const it of items) {
+                if (!it || !(it.resType === 2 || it.dir === true || it.isDir === true)) continue;
+                const fileId = String(it.fileId || it.id || it.file_id || "");
+                const name = String(it.fileName || it.name || it.title || "");
+                if (!fileId || !name || seen.has(fileId)) continue;
+                seen.add(fileId);
+                out.push({ fileId, name });
+                added++;
+            }
+            const total = Number(data && (data.total || data.totalCount));
+            if (items.length === 0 || added === 0) break;
+            if (Number.isFinite(total) && out.length >= total) break;
         }
-        let data = body;
-        if (body && typeof body === "object" && body.data && typeof body.data === "object") data = body.data;
-        const items = (data && (data.list || data.files || data.items || data.records)) || [];
-        return items
-            .filter(it => it && (it.resType === 2 || it.dir === true || it.isDir === true))
-            .map(it => ({
-                fileId: String(it.fileId || it.id || it.file_id || ""),
-                name: String(it.fileName || it.name || it.title || ""),
-            }))
-            .filter(f => f.fileId && f.name);
+        return out;
     }
 
     // 全局搜索文件夹(官方 search_files,只搜文件夹 resType:2)
     async function searchFolders(token, keyword, pageSize) {
-        const r = await apiPost(URL_SEARCH, {
-            name: keyword,       // 官方字段名是 name,不是 keyword
-            page: 0,
-            pageSize: pageSize || 100,
-            orderBy: 0,
-            sortType: 0,
-            resType: 2,          // 只搜文件夹
-        }, token);
-        if (r.status !== 200) throw new Error("HTTP " + r.status);
-        const body = r.body;
-        if (body && body.code !== 0 && body.code != null) {
-            throw new Error((body.msg || body.message) || "code " + body.code);
+        const out = [];
+        const seen = new Set();
+        for (let page = 0; page < MAX_FOLDER_PAGES; page++) {
+            const r = await apiPost(URL_SEARCH, {
+                name: keyword,       // 官方字段名是 name,不是 keyword
+                page: page,
+                pageSize: pageSize || 100,
+                orderBy: 0,
+                sortType: 0,
+                resType: 2,          // 只搜文件夹
+            }, token);
+            if (r.status !== 200) throw new Error("HTTP " + r.status);
+            const body = r.body;
+            if (body && body.code !== 0 && body.code != null) {
+                throw new Error((body.msg || body.message) || "code " + body.code);
+            }
+            let data = body;
+            if (body && typeof body === "object" && body.data && typeof body.data === "object") data = body.data;
+            const items = (data && (data.list || data.files || data.items || data.records)) || [];
+            let added = 0;
+            // 解析:每项可能直接有 fileId/fileName,或包在 fileInfo 里;fullParentIds 可拼路径
+            for (const it of items) {
+                const fi = (it && it.fileInfo) || it || {};
+                const fileId = String(fi.fileId || it.fileId || it.id || "");
+                const name = String(fi.fileName || fi.name || it.fileName || it.name || "");
+                if (!fileId || !name || seen.has(fileId)) continue;
+                seen.add(fileId);
+                out.push({ fileId, name });
+                added++;
+            }
+            const total = Number(data && (data.total || data.totalCount));
+            if (items.length === 0 || added === 0) break;
+            if (Number.isFinite(total) && out.length >= total) break;
         }
-        let data = body;
-        if (body && typeof body === "object" && body.data && typeof body.data === "object") data = body.data;
-        const items = (data && (data.list || data.files || data.items || data.records)) || [];
-        // 解析:每项可能直接有 fileId/fileName,或包在 fileInfo 里;fullParentIds 可拼路径
-        return items.map(it => {
-            const fi = (it && it.fileInfo) || it || {};
-            const fileId = String(fi.fileId || it.fileId || it.id || "");
-            const name = String(fi.fileName || fi.name || it.fileName || it.name || "");
-            return { fileId, name };
-        }).filter(f => f.fileId && f.name);
+        return out;
     }
 
     /* ============================================================
@@ -401,7 +446,7 @@
         if (typeof obj === "string") {
             if (obj.length > 20 && obj.length < 500) {
                 // 裸 token 形态
-                if (/^[A-Za-z0-9._~-]{30,}$/.test(obj)) return obj;
+                if (/^[A-Za-z0-9._~-]{30,}$/.test(obj) && looksLikeAuthToken(obj)) return obj;
             }
             return "";
         }
@@ -410,7 +455,9 @@
         seen.add(obj);
         for (const k of Object.keys(obj)) {
             const v = obj[k];
-            if (/token|auth|session|key/i.test(k) && typeof v === "string" && v.length > 20) {
+            // key 含 token/auth/session/key 只是线索,值还必须通过 token 形态校验,
+            // 否则 tokenExpire 之类的时间戳会被当成 token
+            if (/token|auth|session|key/i.test(k) && typeof v === "string" && v.length > 20 && looksLikeAuthToken(v)) {
                 return v;
             }
             const r = deepExtract(v, depth + 1, seen);
@@ -476,6 +523,7 @@
     }
 
     // 保存 token(带时间戳 + 相关头)
+    // 手动设置 / 重新捕获的 token 视为新凭据,必须清掉 _authFailed,否则 getAccessToken 会跳过它
     function setToken(t, did, smid) {
         const stored = getStoredAuth() || {};
         const auth = {
@@ -485,6 +533,10 @@
             ts: Date.now(),
         };
         setStoredAuth(auth);
+        if (auth.token) {
+            capturedToken = auth.token;
+            resetAuthFailed();
+        }
     }
 
     // 标记认证失败(401/117) → 清 token,等重新捕获
@@ -550,6 +602,7 @@
                 url,
                 headers,
                 data: JSON.stringify(data),
+                timeout: REQUEST_TIMEOUT_MS,
                 onload: (r) => {
                     let body;
                     try { body = JSON.parse(r.responseText); }
@@ -562,7 +615,9 @@
                     }
                     resolve({ status: r.status, body });
                 },
-                onerror: (e) => reject(new Error("网络错误: " + e.error)),
+                // 超时必须显式处理:GM_xmlhttpRequest 没有 timeout 时请求可能永久挂起,worker 会卡死
+                ontimeout: () => reject(new Error("timeout: 请求超时(" + (REQUEST_TIMEOUT_MS / 1000) + "s)")),
+                onerror: (e) => reject(new Error("网络错误: " + ((e && e.error) || "unknown"))),
             });
         });
     }
@@ -587,47 +642,102 @@
      * 从 txt 提取磁力链接
      * ============================================================ */
     // 非全局、无状态正则(避免 /g lastIndex 问题 + 灾难性回溯)
-    const MAGNET_RE2 = /magnet:\?xt=urn:btih:[0-9a-fA-F]{32,40}/i;
+    // base32 用 i 标志:BTIH 的 base32 形式常见小写,magnet 行不能漏
+    // 前后用 [^\s"'<>]* 吃掉 dn/tr 等参数,整条链原样提交
+    const MAGNET_RE2 = /magnet:\?[^\s"'<>]*xt=urn:btih:[0-9a-z]{32,40}[^\s"'<>]*/i;
     const HASH40_RE2 = /\b[0-9a-fA-F]{40}\b/;
-    const HASH32_RE2 = /\b[A-Z2-7]{32}\b/;
+    const HASH32_RE2 = /\b[A-Z2-7]{32}\b/i;
     const TORRENT_URL_RE2 = /^https?:\/\/\S+\.torrent(?:[?#]\S*)?$/i;
+    // .torrent 可能出现在行中间("标题 | https://x.torrent"),单独抽出来
+    const TORRENT_ANY_RE2 = /https?:\/\/[^\s"'<>]+\.torrent(?:[?#][^\s"'<>]*)?/i;
     const ED2K_RE2 = /^ed2k:\/\/\|file\|[^|]+\|/i;
 
-    // 高性能提取:逐行解析,避免灾难性回溯;大文件用分片解析避免卡 UI
-    function extractLineMagnet(line) {
+    // 一行可能含多个磁力/种子(空格或标点分隔),全部提取
+    function extractLineMagnets(line) {
         const s = (line || "").trim();
-        if (!s || s.startsWith("#") || s.startsWith("//")) return null;
-        // 直接全链匹配优先
-        const mm = s.match(MAGNET_RE2);
-        if (mm) return mm[0];
-        // .torrent URL(整行)
-        if (TORRENT_URL_RE2.test(s)) return s;
+        if (!s || s.startsWith("#") || s.startsWith("//")) return [];
+        const out = [];
+        // 全链 magnet:用 matchAll 拿一行里的所有
+        const mg = new RegExp(MAGNET_RE2.source, "gi");
+        let m;
+        while ((m = mg.exec(s)) !== null) out.push(m[0]);
+        if (out.length) return out;
+        // .torrent URL(整行或行内)
+        if (TORRENT_URL_RE2.test(s)) return [s];
+        const ta = s.match(TORRENT_ANY_RE2);
+        if (ta) return [ta[0]];
         // ed2k
-        if (ED2K_RE2.test(s)) return s;
+        if (ED2K_RE2.test(s)) return [s];
         // 纯 40 位 hex
         const h40 = s.match(HASH40_RE2);
-        if (h40) return "magnet:?xt=urn:btih:" + h40[0];
-        // 纯 32 位 base32
+        if (h40) return ["magnet:?xt=urn:btih:" + h40[0].toLowerCase()];
+        // 纯 32 位 base32(大小写都认)
         const h32 = s.match(HASH32_RE2);
-        if (h32) return "magnet:?xt=urn:btih:" + h32[0];
-        return null;
+        if (h32) return ["magnet:?xt=urn:btih:" + h32[0].toUpperCase()];
+        return [];
     }
 
-    // 分片解析大文件,避免卡死 UI;每片 yield 让浏览器刷新
+    // 兼容旧调用:返回单条或 null
+    function extractLineMagnet(line) {
+        const r = extractLineMagnets(line);
+        return r.length ? r[0] : null;
+    }
+
+    // 分片解析大文件:用 FileReader 按块读取,避免 file.text() 一次性把几百 MB 塞进内存
+    const PARSE_CHUNK_BYTES = 4 * 1024 * 1024;   // 每块 4MB
+    async function extractMagnetsFromFile(file, onProgress) {
+        const found = new Set();
+        const total = file.size || 1;
+        let offset = 0;
+        let tail = "";
+        let linesDone = 0;
+        while (offset < total) {
+            const end = Math.min(offset + PARSE_CHUNK_BYTES, total);
+            const chunkText = await readBlobSlice(file, offset, end);
+            offset = end;
+            const text = tail + chunkText;
+            const lines = text.split(/\r?\n/);
+            // 最后一段可能被截断,留到下一块拼接
+            tail = offset < total ? (lines.pop() || "") : "";
+            for (const line of lines) {
+                const ms = extractLineMagnets(line);
+                for (const m of ms) found.add(m);
+                linesDone++;
+            }
+            if (onProgress) {
+                try { onProgress(offset / total, linesDone); } catch (e) { /* ignore */ }
+            }
+            // 让出主线程,避免 UI 冻结
+            await new Promise(r => setTimeout(r, 0));
+        }
+        if (tail) {
+            for (const m of extractLineMagnets(tail)) found.add(m);
+        }
+        return [...found];
+    }
+
+    function readBlobSlice(blob, start, end) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.onerror = () => reject(new Error("读取文件失败"));
+            reader.readAsText(blob.slice(start, end));
+        });
+    }
+
+    // 兼容旧调用:整段文本解析(小文件 / 控制台调试用)
     async function extractMagnetsAsync(text, onProgress) {
         const lines = text.split(/\r?\n/);
         const found = new Set();
-        const CHUNK = 2000;   // 每片 2000 行
+        const CHUNK = 2000;
         for (let i = 0; i < lines.length; i += CHUNK) {
             const end = Math.min(i + CHUNK, lines.length);
             for (let j = i; j < end; j++) {
-                const m = extractLineMagnet(lines[j]);
-                if (m) found.add(m);
+                for (const m of extractLineMagnets(lines[j])) found.add(m);
             }
             if (onProgress) {
                 try { onProgress(Math.min(1, (end / lines.length)), end); } catch (e) { /* ignore */ }
             }
-            // 让出主线程,避免 UI 冻结
             await new Promise(r => setTimeout(r, 0));
         }
         return [...found];
@@ -641,6 +751,28 @@
         const s = String(name || "");
         const max = maxLen || 40;
         return s.length > max ? s.slice(0, max) + "…" : s;
+    }
+
+    // 面板关闭后的重开入口:右下角一个小圆钮,点击重新构建面板
+    function ensureLauncher() {
+        if (document.getElementById("gy-txt-launcher")) return;
+        const b = document.createElement("div");
+        b.id = "gy-txt-launcher";
+        b.textContent = "☁";
+        b.title = "打开光鸭磁力批量添加面板";
+        b.style.cssText = [
+            "position:fixed", "right:20px", "bottom:20px", "z-index:2147483646",
+            "width:44px", "height:44px", "border-radius:50%",
+            "background:linear-gradient(135deg,#007AFF,#5856D6)", "color:#fff",
+            "display:flex", "align-items:center", "justify-content:center",
+            "font-size:20px", "cursor:pointer", "user-select:none",
+            "box-shadow:0 8px 24px rgba(0,122,255,0.35)",
+            "transition:transform 0.16s ease",
+        ].join(";");
+        b.onmouseenter = () => { b.style.transform = "scale(1.06)"; };
+        b.onmouseleave = () => { b.style.transform = "scale(1)"; };
+        b.onclick = () => { b.remove(); buildUI(); };
+        document.body.appendChild(b);
     }
 
     function buildUI() {
@@ -886,7 +1018,7 @@
                 .gy-apple-select {
                     appearance: none;
                     -webkit-appearance: none;
-                    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%3C%238e8e93%3E' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+                    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%238e8e93' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
                     background-repeat: no-repeat;
                     background-position: right 10px center;
                     padding-right: 24px !important;
@@ -1036,7 +1168,10 @@
         });
         document.addEventListener("mouseup", () => dragging = false);
 
-        document.getElementById("gy-txt-close").onclick = () => panel.remove();
+        document.getElementById("gy-txt-close").onclick = () => {
+            panel.remove();
+            ensureLauncher();   // 面板关掉后留一个悬浮按钮,否则只能刷新页面才能找回
+        };
         document.getElementById("gy-txt-pick").onclick = () => document.getElementById("gy-txt-file").click();
         document.getElementById("gy-txt-token").onclick = () => {
             const t = prompt("粘贴光鸭网盘的 access_token(登录后自动提取,留空取消):", getAccessToken());
@@ -1129,12 +1264,14 @@
         document.getElementById("gy-txt-page").onclick = () => {
             const found = new Set();
             const src = document.documentElement.outerHTML;
-            // 全链 magnet
-            const mm = src.matchAll(/magnet:\?xt=urn:btih:[0-9a-fA-F]{32,40}/g);
+            // 全链 magnet(大小写 base32 都认,保留 dn/tr 等参数)
+            const mm = src.matchAll(/magnet:\?[^\s"'<>]*xt=urn:btih:[0-9a-z]{32,40}[^\s"'<>]*/gi);
             for (const m of mm) found.add(m[0]);
             // 40hex / 32base32(独立 token,排除 HTML 属性碎片)
             const h40 = src.matchAll(/\b[0-9a-fA-F]{40}\b/g);
-            for (const m of h40) found.add("magnet:?xt=urn:btih:" + m[0].toUpperCase());
+            for (const m of h40) found.add("magnet:?xt=urn:btih:" + m[0].toLowerCase());
+            const h32 = src.matchAll(/\b[A-Z2-7]{32}\b/gi);
+            for (const m of h32) found.add("magnet:?xt=urn:btih:" + m[0].toUpperCase());
             // .torrent URL
             const tu = src.matchAll(/https?:\/\/[^\s"'<>]+\.torrent(?:[?#][^\s"'<>]*)?/gi);
             for (const m of tu) found.add(m[0]);
@@ -1243,15 +1380,21 @@
             const file = e.target.files[0];
             if (!file) return;
             log("读取文件: " + file.name + " (" + (file.size / 1024).toFixed(1) + " KB)");
-            const text = await file.text();
             log("解析中(大文件请稍候)...");
-            // 异步分片解析,显示进度,不卡 UI
-            const magnets = await extractMagnetsAsync(text, (p, done) => {
-                setProgress(Math.round(p * 100), "解析中 " + done + " 行...");
-            });
+            let magnets;
+            try {
+                // 按块流式解析,几百 MB 的 txt 也不会一次性占满内存
+                magnets = await extractMagnetsFromFile(file, (p, lines) => {
+                    setProgress(Math.round(p * 100), "解析中 " + lines + " 行...");
+                });
+            } catch (err) {
+                log("✗ 解析失败: " + err.message);
+                e.target.value = "";
+                return;
+            }
             setProgress(100, "解析完成");
             log("识别到 " + magnets.length + " 个磁力链接");
-            if (magnets.length === 0) { log("⚠ 未识别到有效磁力链接"); return; }
+            if (magnets.length === 0) { log("⚠ 未识别到有效磁力链接"); e.target.value = ""; return; }
 
             // 记忆过滤:预览将跳过多少已提交
             const alreadyDone = magnets.filter(m => isSubmitted(magnetHash(m)));
@@ -1274,6 +1417,15 @@
                 log("请先选择 txt 文件(解析完成后此按钮才可用)");
                 return;
             }
+            // 先检查凭据,避免用户确认后才在 runBatch 里弹 prompt 或直接失败
+            if (!getAccessToken()) {
+                log("✗ 未提取到 token。请先登录网页版并点「🧪 验证Token」,或用「🔑 设置Token」粘贴");
+                return;
+            }
+            if (isAuthFailed()) {
+                log("✗ token 已失效。请刷新页面重新捕获,或手动设置新 token");
+                return;
+            }
             const n = pendingMagnets.length;
             const ok = confirm("确认开始上传 " + n + " 个磁力链?\n\n将自动跳过已提交的,并遵守今日 " + getDailyLimit() + " 上限。");
             if (!ok) { log("已取消"); return; }
@@ -1281,10 +1433,14 @@
             pendingMagnets = [];   // 防重复点击
             // 显示暂停按钮,开始上传
             const pauseBtn = document.getElementById("gy-txt-pause");
-            if (pauseBtn) pauseBtn.style.display = "block";
-            await runBatch(list);
-            // 上传结束隐藏暂停按钮
-            if (pauseBtn) pauseBtn.style.display = "none";
+            if (pauseBtn) { pauseBtn.style.display = "block"; pauseBtn.textContent = "⏸ 暂停上传"; pauseBtn.style.background = "#FF9500"; }
+            try {
+                await runBatch(list);
+            } finally {
+                // 无论成功/异常/提前 return,都要复位暂停状态,否则下次开始会卡在暂停
+                resumeUpload();
+                if (pauseBtn) pauseBtn.style.display = "none";
+            }
         };
         // 暂停/继续按钮
         const pauseBtn = document.getElementById("gy-txt-pause");
@@ -1317,8 +1473,13 @@
             const chunk = logBuf.join("");
             logBuf = [];
             // 防止日志无限增长:超过 50000 字符截断前半段
-            if (el.textContent.length > 50000) {
-                el.textContent = el.textContent.slice(-30000);
+            // 按行切而不是按字符切,避免把中文/emoji 劈成半个
+            if (el.textContent.length + chunk.length > 50000) {
+                const lines = (el.textContent + chunk).split("\n");
+                while (lines.length > 1 && lines.join("\n").length > 30000) lines.shift();
+                el.textContent = lines.join("\n");
+                el.scrollTop = el.scrollHeight;
+                return;
             }
             el.textContent += chunk;
             el.scrollTop = el.scrollHeight;
@@ -1397,19 +1558,37 @@
         if (parentId) log("目标文件夹: " + targetFolder.name + " (ID " + parentId + ")");
         else log("目标文件夹: (根目录)");
 
-        // === v1.1: 并发池 + 自适应退避 + 临时失败重试 ===
-        const MAX_CONCURRENCY = 3;      // 初始并发
+        // === v1.2: 真正生效的并发池 + 自适应退避 + 额度原子占用 ===
+        const MAX_CONCURRENCY = 3;
         const MIN_CONCURRENCY = 1;
-        let concurrency = MAX_CONCURRENCY;
+        let concurrency = MAX_CONCURRENCY;   // 由调度器每轮重新读取,降/升都生效
         const quota = remainingToday;
         const total = pending.length;
         let ok = 0, fail = 0, done = 0;
-        let stopped = false;
+        let noMore = false;      // 只停止派发新任务;已派发的任务必须跑完
+        let inflight = 0;
         const failReasons = {};
         const seenThisRun = new Set();
         const queue = [...pending];
+        let cursor = 0;
 
-        // 带退避的重试包装:临时失败(网络/超时/429)自动重试 attempts-1 次
+        function currentLimit() {
+            return Math.max(MIN_CONCURRENCY, Math.min(concurrency, MAX_CONCURRENCY));
+        }
+        function noteFailReason(key) {
+            failReasons[key] = (failReasons[key] || 0) + 1;
+            // 动态错误消息可能无限多,只保留前 200 种,避免对象膨胀
+            const keys = Object.keys(failReasons);
+            if (keys.length > 200) delete failReasons[keys[0]];
+        }
+        function updateProgress() {
+            setProgress(
+                Math.round(done / total * 100),
+                "提交 " + done + "/" + total + " (成功 " + ok + "/" + quota + " 失败 " + fail + " 并发 " + currentLimit() + ")"
+            );
+        }
+
+        // 带退避的重试包装:临时失败(网络/超时/429/5xx)自动重试 attempts-1 次
         async function withRetry(fn, baseDelay, label) {
             let delay = baseDelay;
             for (let attempt = 1; ; attempt++) {
@@ -1426,79 +1605,114 @@
             }
         }
 
-        async function worker() {
-            while (!stopped && queue.length > 0) {
-                const m = queue.shift();
-                const hash = magnetHash(m);
-                if (seenThisRun.has(hash)) {
-                    log("⏭ 跳过重复: " + m.slice(0, 50));
-                    done++;
-                    continue;
-                }
-                seenThisRun.add(hash);
-                if (ok >= quota) { stopped = true; break; }
-                if (isAuthFailed()) { stopped = true; break; }
-                await waitIfPaused();
-
-                try {
-                    // 1. 解析磁力链(临时失败自动重试)
-                    const rr = await withRetry(() => resolveUrl(m, token), 500, "解析");
-                    if (rr.status !== 200 || (rr.body && rr.body.code !== 0 && rr.body.code != null)) {
-                        const msg = (rr.body && (rr.body.msg || rr.body.message)) || ("HTTP " + rr.status);
-                        fail++;
-                        failReasons["解析失败: " + msg] = (failReasons["解析失败: " + msg] || 0) + 1;
-                        if (!isTempFailure(msg)) markFailed(hash, "解析失败: " + msg);
-                        log("✗ 解析失败: " + m.slice(0, 50) + " → " + msg);
-                        if (isQuotaExceeded(msg)) {
-                            log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
-                            stopped = true; break;
-                        }
-                        if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
-                        done++;
-                        continue;
+        // 处理单条:返回 "ok" | "fail" | "stop"
+        // "stop" 只表示"不要再派发新任务",已派发的仍会正常完成
+        async function processOne(m) {
+            await waitIfPaused();
+            if (isAuthFailed()) {
+                log("⚠ token 已失效,停止派发新任务。请刷新页面后重试(已提交的已记录,下次自动跳过)");
+                return "stop";
+            }
+            const hash = magnetHash(m);
+            try {
+                // 1. 解析磁力链(临时失败自动重试)
+                const rr = await withRetry(() => resolveUrl(m, token), 500, "解析");
+                const rbody = rr.body && typeof rr.body === "object" ? rr.body : null;
+                const rcode = rbody ? rbody.code : null;
+                if (rr.status !== 200 || (rcode !== 0 && rcode != null)) {
+                    const msg = (rbody && (rbody.msg || rbody.message)) || ("HTTP " + rr.status);
+                    noteFailReason("解析失败: " + msg);
+                    if (!isTempFailure(msg)) markFailed(hash, "解析失败: " + msg);
+                    log("✗ 解析失败: " + m.slice(0, 50) + " → " + msg);
+                    if (isQuotaExceeded(msg)) {
+                        log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
+                        return "stop";
                     }
-                    // 2. 创建任务(临时失败自动重试)
-                    const ct = await withRetry(() => createTask(m, token, { parentId }), 500, "提交");
-                    const cbody = ct.body && typeof ct.body === "object" ? ct.body : null;
-                    const ccode = cbody ? cbody.code : null;
-                    if (ccode === 0 || (cbody && ccode == null && ct.status === 200)) {
-                        ok++;
-                        markSubmitted(hash);
-                        bumpDailyCount();
-                        bumpTotal();
-                        if (concurrency < MAX_CONCURRENCY) concurrency++;   // 恢复并发
-                        log("✓ 已添加: " + m.slice(0, 60));
-                    } else {
-                        const msg = (cbody && (cbody.msg || cbody.message)) || ("HTTP " + ct.status);
-                        fail++;
-                        failReasons[msg] = (failReasons[msg] || 0) + 1;
-                        if (!isTempFailure(msg)) markFailed(hash, msg);
-                        log("✗ 添加失败: " + m.slice(0, 50) + " → " + msg);
-                        if (isQuotaExceeded(msg)) {
-                            log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
-                            stopped = true; break;
-                        }
-                        if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
-                    }
-                } catch (e) {
-                    const msg = e.message || "未知异常";
-                    fail++;
-                    failReasons["异常: " + msg] = (failReasons["异常: " + msg] || 0) + 1;
-                    if (!isTempFailure(msg)) markFailed(hash, "异常: " + msg);
-                    log("✗ 异常: " + m.slice(0, 50) + " → " + msg);
+                    if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
+                    return "fail";
                 }
-                done++;
-                if (done % 5 === 0 || done === total) {
-                    setProgress(Math.round(done / total * 100), "提交 " + done + "/" + total + " (成功 " + ok + "/" + quota + " 失败 " + fail + ")");
+                // 2. 创建任务(临时失败自动重试)
+                const ct = await withRetry(() => createTask(m, token, { parentId }), 500, "提交");
+                const cbody = ct.body && typeof ct.body === "object" ? ct.body : null;
+                const ccode = cbody ? cbody.code : null;
+                if (ccode === 0 || (ccode == null && ct.status === 200)) {
+                    markSubmitted(hash);
+                    bumpDailyCount();
+                    bumpTotal();
+                    if (concurrency < MAX_CONCURRENCY) concurrency++;   // 恢复并发
+                    log("✓ 已添加: " + m.slice(0, 60));
+                    return "ok";
                 }
-                await new Promise(r => setTimeout(r, 400));   // 基础间隔,防洪峰
+                const msg = (cbody && (cbody.msg || cbody.message)) || ("HTTP " + ct.status);
+                noteFailReason(msg);
+                if (!isTempFailure(msg)) markFailed(hash, msg);
+                log("✗ 添加失败: " + m.slice(0, 50) + " → " + msg);
+                if (isQuotaExceeded(msg)) {
+                    log("⚠ 今日云添加次数已超限,立即停止。剩余磁力明天再跑(记忆断点已保存)");
+                    return "stop";
+                }
+                if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
+                return "fail";
+            } catch (e) {
+                const msg = e.message || "未知异常";
+                noteFailReason("异常: " + msg);
+                if (!isTempFailure(msg)) markFailed(hash, "异常: " + msg);
+                log("✗ 异常: " + m.slice(0, 50) + " → " + msg);
+                if (isTempFailure(msg)) concurrency = Math.max(MIN_CONCURRENCY, concurrency - 1);
+                return "fail";
             }
         }
 
         setProgress(0, "开始提交 0/" + total);
-        const workers = [];
-        for (let w = 0; w < concurrency; w++) workers.push(worker());
-        await Promise.all(workers);
+        log("并发上限 " + MAX_CONCURRENCY + ",初始并发 " + concurrency + ",本次额度 " + quota);
+
+        // 调度器:每轮按 currentLimit() 补满在途任务;并发被调低时自然收缩,调高时自动补位
+        const pool = new Set();
+        while (true) {
+            if (noMore && pool.size === 0) break;
+            // 补满空位
+            while (!noMore && pool.size < currentLimit() && cursor < queue.length) {
+                const m = queue[cursor++];
+                const h = magnetHash(m);
+                if (seenThisRun.has(h)) {
+                    log("⏭ 跳过重复: " + m.slice(0, 50));
+                    done++;
+                    updateProgress();
+                    continue;
+                }
+                seenThisRun.add(h);
+                // 额度原子占用:成功数 + 在途数 不能超过今日剩余,避免并发越过限额
+                if (ok + inflight >= quota) {
+                    noMore = true;
+                    log("⚠ 今日额度已用满(" + (ok + inflight) + "/" + quota + "),停止派发新任务");
+                    break;
+                }
+                inflight++;
+                let p;
+                p = processOne(m).then(res => {
+                    if (res === "ok") ok++;
+                    else if (res === "fail") fail++;
+                    else if (res === "stop") noMore = true;
+                }).catch(e => {
+                    fail++;
+                    noteFailReason("调度异常: " + (e && e.message));
+                }).finally(() => {
+                    inflight--;
+                    done++;
+                    pool.delete(p);
+                    updateProgress();
+                });
+                pool.add(p);
+            }
+            if (pool.size === 0) {
+                // 没有在途任务:要么没得派发了,要么额度已满,直接收尾
+                break;
+            }
+            await Promise.race(pool);
+            // 基础间隔,防洪峰;并发为 1 时也更温和
+            await new Promise(r => setTimeout(r, SUBMIT_INTERVAL_MS));
+        }
+        await Promise.all(pool);
 
         // 汇总失败原因
         const reasonLines = Object.entries(failReasons)
@@ -1517,18 +1731,47 @@
         log("记忆已保存,下次运行自动跳过已提交/失败的");
     }
     // 挂载
+    // @run-at document-start:此时 document.body 还不存在,必须等 DOM 可写
+    // 拦截器要尽早挂上,否则页面首屏的鉴权请求已经发完;UI 则等 body 可用
+    function waitForBody(cb) {
+        if (document.body) { cb(); return; }
+        const mo = new MutationObserver(() => {
+            if (document.body) { mo.disconnect(); cb(); }
+        });
+        mo.observe(document.documentElement || document, { childList: true, subtree: true });
+        // 兜底:某些情况下 DOMContentLoaded 先到
+        document.addEventListener("DOMContentLoaded", () => {
+            mo.disconnect();
+            if (document.body) cb();
+        }, { once: true });
+    }
+
+    const flushAll = () => { flushSubmitted(); flushFailedMap(); };
     const inject = () => {
-        if (location.hostname.includes("guangyapan.com")) {
-            startCapture();
+        if (!location.hostname.includes("guangyapan.com")) return;
+        startCapture();
+        waitForBody(() => {
             buildUI();
-        }
+            // 关页面/切后台时立刻落盘,避免 debounce 窗口内的已提交记录丢失
+            window.addEventListener("beforeunload", flushAll);
+            document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState === "hidden") flushAll();
+            });
+        });
     };
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", inject);
-    else inject();
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", inject, { once: true });
+    } else {
+        inject();
+    }
 
     // 控制台暴露
     window.gyTxtCloud = {
-        extractMagnets: extractLineMagnet, runBatch, getAccessToken, setToken,
+        extractMagnets: extractLineMagnet,
+        extractAll: extractLineMagnets,
+        extractMagnetsAsync,
+        extractMagnetsFromFile,
+        runBatch, getAccessToken, setToken,
         memory: {
             getSubmittedMap, isSubmitted, markSubmitted,
             getTodayCount, todayLimitReached, getTotalSubmitted,
@@ -1536,7 +1779,7 @@
             dailyLimit: getDailyLimit(),
         },
         failed: {
-            getFailedMap, isFailed, markFailed, isTempFailure,
+            getFailedMap, isFailed, markFailed, isTempFailure, isQuotaExceeded,
         },
         backup: {
             exportMemory, importMemory,
