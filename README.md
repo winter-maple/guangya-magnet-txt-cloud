@@ -21,6 +21,24 @@
 
 ## 更新记录
 
+### v1.3.0
+
+- 修复 `@run-at document-start` 白给:注入逻辑原本挂在 `DOMContentLoaded`,首屏鉴权请求全漏。拦截器现在在 document-start 同步挂载,UI 仍等 body
+- 修复 token 整批锁死:`runBatch` 开头取一次 token,刷新/轮换后整批报废。改为每步现取,失效时等待页面重新捕获(最多 20s)
+- 修复 5xx 不重试:`apiPost` 永不 reject,`withRetry` 形同虚设。业务错误现在带 `httpStatus`,5xx/429/超时/网络错误都进重试
+- 修复 token 失效死循环:页面把同一枚死 token 重新塞回请求头时不再被采纳(失效指纹比对)
+- 修复 `importMemory` 只写存储不刷内存缓存,本会话内失败黑名单仍读旧 map
+- 修复每日计数跨标签页 read-modify-write 丢计数;新增 `GM_addValueChangeListener` 同步
+- 修复 `markFailed` 超上限时每条失败都全量 sort;改为每分钟最多整理一次、批量淘汰 10%
+- 修复每次捕获 Authorization 头都写一次 GM 存储;改为去重 + 60s 节流
+- 修复 `TEMP_FAIL_RE` 误报:`generate` 命中 `rate`、`剩余 500 次` 命中 `5\d\d`
+- 修复同 infohash 不同 `tr`/`dn` 被当成多条重复提交;去重键统一为 infohash
+- 修复一行两条 magnet 被贪婪正则吞成一条
+- 修复 `window.gyTxtCloud.memory.dailyLimit` 是启动快照;改为 getter/setter
+- 并发恢复从"成功一次就拉满"改为 34% 概率回升,避免与降档形成锯齿
+- 请求节流从"每个 worker 各睡 400ms"改为派发端统一节流;429 触发 5s 全局冷却
+- 存储层加降级:GM 对象写入失败时退化为 JSON 字符串,读取侧两者兼容
+
 ### v1.2.0
 
 - 修复自适应并发失效:并发数此前只用于初始化 worker,降/升都不生效
