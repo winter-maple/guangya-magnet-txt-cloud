@@ -21,6 +21,14 @@
 
 ## 更新记录
 
+### v1.3.1
+
+- 修复 5xx/429 实际不重试:`apiPost` 对 HTTP 错误仍是 resolve,`withRetry` 现在把 5xx/429 转成可重试异常;429 同时触发全局冷却并把并发压到 1
+- 修复认证失效把条目写进永久黑名单:401/117 不再 `markFailed`,改为等待新 token 后重试本条一次,仍失败则停批
+- 修复失效 token 被 localStorage 重新取回:`getAccessToken` 所有来源都过滤失效指纹,`waitForFreshToken` 只接受非死 token;`markAuthFailed` 记录实际失败的 token
+- 修复跨标签页额度同步:派发前按存储中的当日已用 + 在途预留判断,删除无效的 `_dailyEpoch`;两个标签页不会各自按旧剩余量派发
+- 测试:修正硬编码日期的用例,补派发额度、HTTP 可重试状态、`httpError` 认证标记的回归(38 项全过)
+
 ### v1.3.0
 
 - 修复 `@run-at document-start` 白给:注入逻辑原本挂在 `DOMContentLoaded`,首屏鉴权请求全漏。拦截器现在在 document-start 同步挂载,UI 仍等 body
