@@ -14,7 +14,7 @@ if (marker < 0) { console.error("找不到截断点"); process.exit(1); }
 // marker 是注释块的第二行,块头在它上一行
 const open = marker - 1;
 if (!lines[open].trim().startsWith("/*")) { console.error("截断点不是注释块开头: " + lines[open]); process.exit(1); }
-const EXPORTS = "globalThis.__api = { magnetHash, isTempFailure, isQuotaExceeded, markSubmitted, flushSubmitted, isSubmitted, getTodayCount, bumpDailyCount, markFailed, getFailedMap, getDailyLimit, todayLimitReached };";
+const EXPORTS = "globalThis.__api = { magnetHash, isTempFailure, isQuotaExceeded, markSubmitted, flushSubmitted, isSubmitted, getTodayCount, bumpDailyCount, markFailed, getFailedMap, getDailyLimit, todayLimitReached, hasQuotaForDispatch, isRetryableHttp, todayStr };";
 const core = lines.slice(0, open).join("\n") + "\n" + EXPORTS + "\n})();\n";
 
 const store = {};
@@ -90,7 +90,7 @@ t.markSubmitted("h1"); t.flushSubmitted();
 ok("写入后可读", t.isSubmitted("h1"));
 const before = t.getTodayCount(); t.bumpDailyCount();
 ok("额度自增", t.getTodayCount() === before + 1, "got " + t.getTodayCount());
-store["gy_daily_count"] = { "2026-10-19": 5 };
+store["gy_daily_count"] = { [t.todayStr()]: 5 };
 ok("旧结构 {count,limit} 兼容", t.getTodayCount() === 5, "got " + t.getTodayCount());
 
 console.log("[6] 失败黑名单");
@@ -108,11 +108,43 @@ console.log("[7] token 失效指纹(单独提取)");
     vm.createContext(actx);
     vm.runInContext(chunk + "\nglobalThis.__a = { markAuthFailed, isAuthFailed, resetAuthFailed, isDeadToken, tokenSig };", actx);
     const a = actx.__a;
-    a.markAuthFailed();
+    a.markAuthFailed("dead-token-abcdefghijklmnopqrstuvwxyz");
     ok("markAuthFailed 后 isAuthFailed", a.isAuthFailed());
+    ok("失效 token 被指纹记录", a.isDeadToken("dead-token-abcdefghijklmnopqrstuvwxyz"));
+    ok("新 token 不被误杀", !a.isDeadToken("fresh-token-abcdefghijklmnopqrstuvwxyz"));
     a.resetAuthFailed();
     ok("reset 后清除失效", !a.isAuthFailed());
+    ok("reset 后清除指纹", !a.isDeadToken("dead-token-abcdefghijklmnopqrstuvwxyz"));
     ok("tokenSig 不泄露完整 token", a.tokenSig("y".repeat(200)).length < 60);
+  }
+}
+
+console.log("[8] 派发额度与 HTTP 可重试判定");
+ok("在途未占满可派发", t.hasQuotaForDispatch(10, 8, 1));
+ok("在途占满停止", !t.hasQuotaForDispatch(10, 8, 2));
+ok("已用满停止", !t.hasQuotaForDispatch(10, 10, 0));
+ok("已超额停止", !t.hasQuotaForDispatch(10, 12, 0));
+ok("5xx 可重试", t.isRetryableHttp(502));
+ok("429 可重试", t.isRetryableHttp(429));
+ok("401 不进 HTTP 重试层", !t.isRetryableHttp(401));
+ok("400 不可重试", !t.isRetryableHttp(400));
+
+console.log("[9] httpError 认证标记(单独提取)");
+{
+  const start = lines.findIndex(l => l.includes("function httpError"));
+  const end = lines.findIndex((l, i) => i > start && l.includes("function apiPost"));
+  if (start < 0 || end < 0) { console.log("  SKIP 找不到 httpError 段"); }
+  else {
+    const chunk = lines.slice(start, end).join("\n");
+    const hctx = { Error, String, Object, isTempFailure: () => false, isQuotaExceeded: () => false };
+    vm.createContext(hctx);
+    vm.runInContext(chunk + "\nglobalThis.__h = { httpError };", hctx);
+    const h = hctx.__h;
+    ok("401 标记 isAuth", h.httpError({ status: 401 }, { code: 401 }).isAuth === true);
+    ok("业务码 117 标记 isAuth", h.httpError({ status: 200 }, { code: 117 }).isAuth === true);
+    ok("500 标记 isTemp", h.httpError({ status: 500 }, { code: 500 }).isTemp === true);
+    ok("429 标记 isRateLimited", h.httpError({ status: 429 }, { code: 429 }).isRateLimited === true);
+    ok("普通业务错误不标记 isAuth", h.httpError({ status: 200 }, { code: 1, msg: "无效磁力" }).isAuth !== true);
   }
 }
 
